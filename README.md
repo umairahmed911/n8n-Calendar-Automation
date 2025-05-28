@@ -1,4 +1,4 @@
-# 🤖 PFAI_Assignment#04 – n8n AI-Powered Calendar Automation
+# 🤖 n8n AI-Powered Calendar Automation
 
 This project is an intelligent automation workflow built with [n8n](https://n8n.io/), integrating **Google Calendar**, **Google Gemini AI**, and **LangChain Agents**. It interprets chat-based inputs to perform smart calendar operations (create, update, delete, and retrieve events), and notifies users via Gmail.
 
