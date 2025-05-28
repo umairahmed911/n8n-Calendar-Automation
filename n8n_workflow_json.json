@@ -1,0 +1,588 @@
+{
+  "name": "Customer Support Automation - Free APIs",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "support-ticket",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "support-webhook"
+    },
+    {
+      "parameters": {
+        "protocol": "imap",
+        "server": "imap.gmail.com",
+        "port": 993,
+        "secure": true,
+        "email": "={{ $env.SUPPORT_EMAIL }}",
+        "password": "={{ $env.EMAIL_PASSWORD }}",
+        "folder": "INBOX",
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute",
+              "minute": 5
+            }
+          ]
+        }
+      },
+      "id": "email-trigger",
+      "name": "Email Trigger",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [240, 120]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Standardize incoming data from different sources\nconst items = $input.all();\nconst standardizedTickets = [];\n\nfor (const item of items) {\n  let ticket = {\n    id: item.json.id || Date.now().toString() + Math.random().toString(36).substr(2, 9),\n    customerEmail: '',\n    customerName: '',\n    subject: '',\n    message: '',\n    source: '',\n    timestamp: new Date().toISOString(),\n    priority: 'medium',\n    status: 'new'\n  };\n  \n  // Handle email source\n  if (item.json.subject && item.json.from) {\n    ticket.customerEmail = item.json.from;\n    ticket.customerName = item.json.fromName || item.json.from.split('@')[0];\n    ticket.subject = item.json.subject;\n    ticket.message = item.json.text || item.json.html || '';\n    ticket.source = 'email';\n  }\n  // Handle webhook/form source\n  else if (item.json.email) {\n    ticket.customerEmail = item.json.email;\n    ticket.customerName = item.json.name || 'Unknown Customer';\n    ticket.subject = item.json.subject || 'Support Request';\n    ticket.message = item.json.message || item.json.description || '';\n    ticket.source = 'web_form';\n  }\n  // Handle chat source\n  else if (item.json.chat_message) {\n    ticket.customerEmail = item.json.user_email || 'unknown@example.com';\n    ticket.customerName = item.json.user_name || 'Chat User';\n    ticket.subject = 'Chat Support Request';\n    ticket.message = item.json.chat_message;\n    ticket.source = 'chat';\n  }\n  // Generic fallback\n  else {\n    ticket.customerEmail = item.json.customerEmail || 'unknown@example.com';\n    ticket.customerName = item.json.customerName || 'Unknown';\n    ticket.subject = item.json.subject || 'Support Request';\n    ticket.message = item.json.message || JSON.stringify(item.json);\n    ticket.source = 'unknown';\n  }\n  \n  standardizedTickets.push({ json: ticket });\n}\n\nreturn standardizedTickets;"
+      },
+      "id": "parse-message",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "queryAuth": {
+          "key": "{{ $env.GEMINI_API_KEY }}"
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "contents",
+              "value": "=[{\"parts\":[{\"text\":\"You are a customer support ticket classifier. Analyze the ticket and respond with ONLY a JSON object containing:\\n- category: one of [technical, billing, general, complaint, feature_request, account, shipping, refund]\\n- priority: one of [low, medium, high, urgent]\\n- sentiment: one of [positive, neutral, negative]\\n- intent: one of [question, complaint, request, compliment, refund_request]\\n- urgency_score: number from 1-10\\n- can_auto_resolve: boolean (true if this seems like a simple question that could be answered from FAQ)\\n\\nTicket Details:\\nSubject: {{ $json.subject }}\\nMessage: {{ $json.message }}\\nCustomer: {{ $json.customerName }}\\nSource: {{ $json.source }}\\n\\nRespond with ONLY the JSON object, no other text.\"}]}]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "classify-with-gemini",
+      "name": "Classify with Gemini",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 220]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Parse Gemini classification and merge with ticket data\nconst ticket = $('Parse Message').first().json;\nlet classification;\n\ntry {\n  const geminiResponse = $json.candidates[0].content.parts[0].text;\n  // Clean up response - remove markdown formatting if present\n  const cleanedResponse = geminiResponse.replace(/```json\\n?|```\\n?/g, '').trim();\n  classification = JSON.parse(cleanedResponse);\n} catch (error) {\n  console.log('Error parsing Gemini response:', error);\n  // Fallback classification if AI response is malformed\n  classification = {\n    category: 'general',\n    priority: 'medium',\n    sentiment: 'neutral',\n    intent: 'question',\n    urgency_score: 5,\n    can_auto_resolve: false\n  };\n}\n\n// Merge classification with original ticket\nconst enrichedTicket = {\n  ...ticket,\n  category: classification.category || 'general',\n  priority: classification.priority || 'medium',\n  sentiment: classification.sentiment || 'neutral',\n  intent: classification.intent || 'question',\n  urgency_score: classification.urgency_score || 5,\n  can_auto_resolve: classification.can_auto_resolve || false,\n  ai_confidence: 0.85,\n  processed_at: new Date().toISOString()\n};\n\n// Auto-escalate urgent tickets\nif (classification.urgency_score >= 8 || classification.priority === 'urgent') {\n  enrichedTicket.escalated = true;\n  enrichedTicket.assignee = 'senior_support';\n  enrichedTicket.status = 'escalated';\n}\n\n// Mark for auto-resolution if possible\nif (classification.can_auto_resolve && classification.urgency_score < 7) {\n  enrichedTicket.auto_resolve_candidate = true;\n}\n\nreturn { json: enrichedTicket };"
+      },
+      "id": "process-classification",
+      "name": "Process Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "queryAuth": {
+          "key": "{{ $env.GEMINI_API_KEY }}"
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "contents",
+              "value": "=[{\"parts\":[{\"text\":\"You are a helpful customer support agent. Based on the customer's message, provide a helpful response.\\n\\nIf the issue is:\\n- Simple FAQ: Provide a direct, helpful answer\\n- Complex technical: Respond with 'ESCALATE_TECHNICAL'\\n- Billing/Account: Respond with 'ESCALATE_BILLING'\\n- Complaint: Provide empathetic response and say you're connecting them with a specialist\\n- Urgent: Respond with 'ESCALATE_URGENT'\\n\\nKeep responses friendly, professional, and under 200 words. Include next steps when appropriate.\\n\\nCustomer Issue:\\nCategory: {{ $json.category }}\\nPriority: {{ $json.priority }}\\nSentiment: {{ $json.sentiment }}\\nUrgency Score: {{ $json.urgency_score }}\\n\\nSubject: {{ $json.subject }}\\nMessage: {{ $json.message }}\\n\\nCustomer: {{ $json.customerName }}\\nEmail: {{ $json.customerEmail }}\"}]}]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "generate-response-gemini",
+      "name": "Generate Response with Gemini",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "multipleMatches": false
+          },
+          "conditions": [
+            {
+              "id": "urgent-condition",
+              "leftValue": "={{ $json.urgency_score }}",
+              "rightValue": "8",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "escalate-response",
+              "leftValue": "={{ $('Generate Response with Gemini').item.json.candidates[0].content.parts[0].text }}",
+              "rightValue": "ESCALATE",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            },
+            {
+              "id": "billing-category",
+              "leftValue": "={{ $json.category }}",
+              "rightValue": "billing",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combineOperation": "any"
+        },
+        "fallbackOutput": 3
+      },
+      "id": "response-router",
+      "name": "Response Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1340, 220]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Create urgent escalation ticket\nconst ticket = $('Process Classification').first().json;\nconst aiResponse = $('Generate Response with Gemini').first().json.candidates[0].content.parts[0].text;\n\nconst escalationData = {\n  ...ticket,\n  status: 'escalated',\n  escalation_reason: 'High urgency detected by AI classification',\n  escalated_at: new Date().toISOString(),\n  assignee: 'senior_support_team',\n  sla_deadline: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours\n  ai_response: aiResponse,\n  escalation_type: 'urgent'\n};\n\nreturn { json: escalationData };"
+      },
+      "id": "urgent-escalation",
+      "name": "Urgent Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 100]
+    },
+    {
+      "parameters": {
+        "resource": "send",
+        "toEmail": "={{ $('Process Classification').item.json.customerEmail }}",
+        "subject": "Re: {{ $('Process Classification').item.json.subject }}",
+        "emailType": "text",
+        "message": "Dear {{ $('Process Classification').item.json.customerName }},\n\nThank you for contacting our support team. We've received your message and here's our response:\n\n{{ $('Generate Response with Gemini').item.json.candidates[0].content.parts[0].text }}\n\nTicket ID: {{ $('Process Classification').item.json.id }}\n\nIf this doesn't fully resolve your issue, please reply to this email and we'll have a human agent assist you further.\n\nBest regards,\nCustomer Support Team\n\n---\nThis is an automated response. For immediate assistance with urgent matters, please call our support line.",
+        "options": {
+          "fromName": "Customer Support"
+        }
+      },
+      "id": "send-auto-response",
+      "name": "Send Auto Response (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1560, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.airtable.com/v0/{{ $env.AIRTABLE_BASE_ID }}/Support%20Tickets",
+        "authentication": "headerAuth",
+        "headerAuth": {
+          "name": "Authorization",
+          "value": "Bearer {{ $env.AIRTABLE_API_KEY }}"
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "={\n  \"Ticket ID\": \"{{ $('Process Classification').item.json.id }}\",\n  \"Customer Email\": \"{{ $('Process Classification').item.json.customerEmail }}\",\n  \"Customer Name\": \"{{ $('Process Classification').item.json.customerName }}\",\n  \"Subject\": \"{{ $('Process Classification').item.json.subject }}\",\n  \"Message\": \"{{ $('Process Classification').item.json.message }}\",\n  \"Category\": \"{{ $('Process Classification').item.json.category }}\",\n  \"Priority\": \"{{ $('Process Classification').item.json.priority }}\",\n  \"Status\": \"{{ $('Process Classification').item.json.status || 'new' }}\",\n  \"Source\": \"{{ $('Process Classification').item.json.source }}\",\n  \"Urgency Score\": {{ $('Process Classification').item.json.urgency_score }},\n  \"Sentiment\": \"{{ $('Process Classification').item.json.sentiment }}\",\n  \"Created At\": \"{{ $('Process Classification').item.json.timestamp }}\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "store-in-airtable",
+      "name": "Store in Airtable (Free)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 220]
+    },
+    {
+      "parameters": {
+        "resource": "send",
+        "toEmail": "={{ $env.ESCALATION_EMAIL || 'senior-support@company.com' }}",
+        "subject": "URGENT: Escalated Support Ticket #{{ $json.id }}",
+        "emailType": "text",
+        "message": "An urgent support ticket has been escalated and requires immediate attention.\n\nTicket Details:\n- ID: {{ $json.id }}\n- Customer: {{ $json.customerName }} ({{ $json.customerEmail }})\n- Subject: {{ $json.subject }}\n- Category: {{ $json.category }}\n- Priority: {{ $json.priority }}\n- Urgency Score: {{ $json.urgency_score }}/10\n- Sentiment: {{ $json.sentiment }}\n\nCustomer Message:\n{{ $json.message }}\n\nAI Analysis:\n- Intent: {{ $json.intent }}\n- Escalation Reason: {{ $json.escalation_reason }}\n- SLA Deadline: {{ $json.sla_deadline }}\n\nPlease respond within 2 hours.\n\n---\nAutomated Support System",
+        "options": {
+          "fromName": "Support System"
+        }
+      },
+      "id": "notify-escalation-gmail",
+      "name": "Notify Escalation Team (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1780, 100]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * *"
+            }
+          ]
+        }
+      },
+      "id": "daily-followup-trigger",
+      "name": "Daily Follow-up Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [240, 500]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.airtable.com/v0/{{ $env.AIRTABLE_BASE_ID }}/Support%20Tickets",
+        "authentication": "headerAuth",
+        "headerAuth": {
+          "name": "Authorization",
+          "value": "Bearer {{ $env.AIRTABLE_API_KEY }}"
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "filterByFormula",
+              "value": "AND(OR({Status}='resolved_auto',{Status}='closed'), IS_AFTER({Created At}, DATEADD(TODAY(), -2, 'day')), IS_BEFORE({Created At}, DATEADD(TODAY(), -1, 'day')), {Follow-up Sent}='')"
+            },
+            {
+              "name": "fields",
+              "value": "Ticket ID,Customer Email,Customer Name,Subject,Created At,Status"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-followup-tickets-airtable",
+      "name": "Get Follow-up Tickets (Airtable)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 500]
+    },
+    {
+      "parameters": {
+        "resource": "send",
+        "toEmail": "={{ $json.fields['Customer Email'] }}",
+        "subject": "How did we do? - Ticket #{{ $json.fields['Ticket ID'] }}",
+        "emailType": "text",
+        "message": "Hi {{ $json.fields['Customer Name'] }},\n\nWe hope this email finds you well. We wanted to follow up on your recent support request (Ticket #{{ $json.fields['Ticket ID'] }}) regarding \"{{ $json.fields.Subject }}\".\n\nDid our response help resolve your issue? We'd love to hear about your experience.\n\n🌟 Please rate your experience by replying with a number from 1-5:\n1 = Very Unsatisfied\n2 = Unsatisfied  \n3 = Neutral\n4 = Satisfied\n5 = Very Satisfied\n\nIf you need any further assistance, please don't hesitate to reach out to us. We're here to help!\n\nThank you for choosing our service.\n\nBest regards,\nCustomer Support Team",
+        "options": {
+          "fromName": "Customer Support"
+        }
+      },
+      "id": "send-followup-gmail",
+      "name": "Send Follow-up Email (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [680, 500]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "https://api.airtable.com/v0/{{ $env.AIRTABLE_BASE_ID }}/Support%20Tickets/{{ $json.id }}",
+        "authentication": "headerAuth",
+        "headerAuth": {
+          "name": "Authorization",
+          "value": "Bearer {{ $env.AIRTABLE_API_KEY }}"
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "={\n  \"Follow-up Sent\": true,\n  \"Follow-up Sent At\": \"{{ new Date().toISOString() }}\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mark-followup-sent-airtable",
+      "name": "Mark Follow-up Sent (Airtable)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"status\": \"success\",\n  \"message\": \"Support ticket received and processed\",\n  \"ticket_id\": \"{{ $('Process Classification').item.json.id }}\",\n  \"estimated_response_time\": \"{{ $('Process Classification').item.json.priority === 'urgent' ? '2 hours' : '24 hours' }}\",\n  \"category\": \"{{ $('Process Classification').item.json.category }}\",\n  \"priority\": \"{{ $('Process Classification').item.json.priority }}\"\n}"
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://discord.com/api/webhooks/{{ $env.DISCORD_WEBHOOK_ID }}/{{ $env.DISCORD_WEBHOOK_TOKEN }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "embeds",
+              "value": "=[{\n  \"title\": \"🚨 URGENT Support Ticket Escalated\",\n  \"description\": \"A high-priority support ticket requires immediate attention\",\n  \"color\": 15158332,\n  \"fields\": [\n    {\n      \"name\": \"Ticket ID\",\n      \"value\": \"{{ $json.id }}\",\n      \"inline\": true\n    },\n    {\n      \"name\": \"Customer\",\n      \"value\": \"{{ $json.customerName }}\\n{{ $json.customerEmail }}\",\n      \"inline\": true\n    },\n    {\n      \"name\": \"Priority\",\n      \"value\": \"{{ $json.priority }} ({{ $json.urgency_score }}/10)\",\n      \"inline\": true\n    },\n    {\n      \"name\": \"Category\",\n      \"value\": \"{{ $json.category }}\",\n      \"inline\": true\n    },\n    {\n      \"name\": \"Sentiment\",\n      \"value\": \"{{ $json.sentiment }}\",\n      \"inline\": true\n    },\n    {\n      \"name\": \"SLA Deadline\",\n      \"value\": \"{{ $json.sla_deadline }}\",\n      \"inline\": true\n    },\n    {\n      \"name\": \"Subject\",\n      \"value\": \"{{ $json.subject }}\",\n      \"inline\": false\n    },\n    {\n      \"name\": \"Message\",\n      \"value\": \"{{ $json.message.length > 500 ? $json.message.substring(0, 500) + '...' : $json.message }}\",\n      \"inline\": false\n    }\n  ],\n  \"timestamp\": \"{{ new Date().toISOString() }}\",\n  \"footer\": {\n    \"text\": \"Automated Support System\"\n  }\n}]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "discord-notification",
+      "name": "Discord Escalation Alert (Free)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 180]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "Classify with Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify with Gemini": {
+      "main": [
+        [
+          {
+            "node": "Process Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Classification": {
+      "main": [
+        [
+          {
+            "node": "Generate Response with Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Response with Gemini": {
+      "main": [
+        [
+          {
+            "node": "Response Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Response Router": {
+      "main": [
+        [
+          {
+            "node": "Urgent Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Store in Airtable (Free)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Store in Airtable (Free)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Auto Response (Gmail)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Store in Airtable (Free)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Urgent Escalation": {
+      "main": [
+        [
+          {
+            "node": "Notify Escalation Team (Gmail)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Discord Escalation Alert (Free)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Store in Airtable (Free)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Auto Response (Gmail)": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Follow-up Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Follow-up Tickets (Airtable)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Follow-up Tickets (Airtable)": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up Email (Gmail)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Follow-up Email (Gmail)": {
+      "main": [
+        [
+          {
+            "node": "Mark Follow-up Sent (Airtable)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "1",
+      "name": "customer-support-free"
+    }
+  ],
+  "triggerCount": 2,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
